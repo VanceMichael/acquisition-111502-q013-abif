@@ -1,0 +1,11 @@
+{
+  "/files/trace.ab1": {
+    "file": "trace.ab1",
+    "mediaType": "application/octet-stream",
+    "partialFile": "trace.ab1.partial"
+  },
+  "/deliveries": {
+    "file": "delivery.json",
+    "mediaType": "application/json"
+  }
+}

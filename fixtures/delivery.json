@@ -1,0 +1,15 @@
+{
+  "deliveryId": "delivery-1",
+  "revision": "r1",
+  "roots": [
+    {
+      "href": "/files/trace.ab1"
+    }
+  ],
+  "resources": [
+    {
+      "href": "/files/trace.ab1",
+      "name": "trace.ab1"
+    }
+  ]
+}
