@@ -121,6 +121,32 @@ export class Archive {
     });
   }
 
+  async addIssues(collectionId, entries) {
+    identifier(collectionId);
+    if (!Array.isArray(entries) || entries.length === 0) return [];
+    const accepted = [];
+    for (const entry of entries) {
+      if (!entry || typeof entry.reason !== 'string' || !entry.reason || typeof entry.location !== 'string' || !entry.location) {
+        throw Object.assign(new Error('invalid_issue'), { status: 400 });
+      }
+      if (entry.receiptId !== undefined) {
+        const receipt = await this.receipt(entry.receiptId);
+        if (receipt.collectionId !== collectionId) throw Object.assign(new Error('provenance_scope'), { status: 400 });
+      }
+      accepted.push(entry);
+    }
+    return this.serialized(async () => {
+      const collection = await this.collection(collectionId);
+      for (const entry of accepted) {
+        const duplicate = collection.issues.some(existing => existing.reason === entry.reason &&
+          existing.location === entry.location && existing.receiptId === entry.receiptId && existing.callVersion === entry.callVersion);
+        if (!duplicate) collection.issues.push(entry);
+      }
+      await this.saveJson(join(this.directory, 'collections', collectionId + '.json'), collection);
+      return collection.issues;
+    });
+  }
+
   async list() {
     return (await readdir(join(this.directory, 'collections'))).filter(name => name.endsWith('.json')).map(name => name.slice(0, -5));
   }

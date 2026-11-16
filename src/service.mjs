@@ -2,6 +2,7 @@ import { createServer } from 'node:http';
 import { Archive } from './archive.mjs';
 import { retrieve } from './transport.mjs';
 import { summarize } from './summary.mjs';
+import { parseAbif, isAbif } from './abif.mjs';
 
 export function json(response, status, value) {
   response.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
@@ -21,6 +22,68 @@ async function requestBody(request) {
   } catch {
     throw Object.assign(new Error('invalid_json'), { status: 400 });
   }
+}
+
+async function acquireInto(archive, { collectionId, entry, allowedOrigin, visited, depth, parentReceiptId }) {
+  const receiptIds = [];
+  if (visited.has(entry)) return receiptIds;
+  visited.add(entry);
+
+  let result;
+  try {
+    result = await retrieve(entry, allowedOrigin);
+  } catch (error) {
+    if (parentReceiptId) {
+      await archive.addIssues(collectionId, [{
+        reason: 'source_dependency_unavailable',
+        location: 'entry:' + entry,
+        receiptId: parentReceiptId,
+        detail: error.status ? error.message : 'retrieval_failed'
+      }]);
+      return receiptIds;
+    }
+    throw error;
+  }
+
+  const receipt = await archive.receive({ collectionId, sourceKey: entry, revision: result.revision,
+    mediaType: result.mediaType, bytes: result.bytes, summary: summarize(result.bytes, result.mediaType) });
+  receiptIds.push(receipt.receiptId);
+
+  if (isAbif(result.bytes)) {
+    const interpreted = parseAbif(result.bytes, { receiptId: receipt.receiptId });
+    for (const record of interpreted.records) await archive.addRecord(collectionId, record);
+    await archive.addIssues(collectionId, interpreted.issues);
+    return receiptIds;
+  }
+
+  let delivery = null;
+  try {
+    const value = JSON.parse(result.bytes.toString('utf8'));
+    if (value && typeof value === 'object' && Array.isArray(value.roots)) delivery = value;
+  } catch {}
+  if (!delivery || depth <= 0) return receiptIds;
+
+  for (const root of delivery.roots) {
+    if (!root || typeof root.href !== 'string') {
+      await archive.addIssues(collectionId, [{
+        reason: 'invalid_root_reference',
+        location: 'delivery:roots',
+        receiptId: receipt.receiptId
+      }]);
+      continue;
+    }
+    let child;
+    try { child = new URL(root.href, entry).href; } catch {
+      await archive.addIssues(collectionId, [{
+        reason: 'invalid_root_reference', location: 'entry:' + root.href, receiptId: receipt.receiptId
+      }]);
+      continue;
+    }
+    receiptIds.push(...await acquireInto(archive, {
+      collectionId, entry: child, allowedOrigin, visited, depth: depth - 1, parentReceiptId: receipt.receiptId
+    }));
+  }
+  return receiptIds;
 }
 
 export async function createService({ directory, allowedOrigin }) {
@@ -53,10 +116,14 @@ export async function createService({ directory, allowedOrigin }) {
       if (request.method === 'POST' && url.pathname === '/acquisitions') {
         const body = await requestBody(request);
         if (typeof body.entry !== 'string') throw Object.assign(new Error('missing_entry'), { status: 400 });
-        const result = await retrieve(body.entry, allowedOrigin);
-        const receipt = await archive.receive({ collectionId: body.collectionId, sourceKey: body.entry, revision: result.revision,
-          mediaType: result.mediaType, bytes: result.bytes, summary: summarize(result.bytes, result.mediaType) });
-        return json(response, 201, { collectionId: body.collectionId, receiptIds: [receipt.receiptId] });
+        const receiptIds = await acquireInto(archive, {
+          collectionId: body.collectionId,
+          entry: body.entry,
+          allowedOrigin,
+          visited: new Set(),
+          depth: 1
+        });
+        return json(response, 201, { collectionId: body.collectionId, receiptIds });
       }
       return json(response, 404, { error: 'not_found' });
     } catch (error) {
