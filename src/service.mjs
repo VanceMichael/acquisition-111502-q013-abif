@@ -1,7 +1,8 @@
 import { createServer } from 'node:http';
 import { Archive } from './archive.mjs';
-import { retrieve } from './transport.mjs';
+import { retrieveDelivery } from './transport.mjs';
 import { summarize } from './summary.mjs';
+import { interpretAbif } from './abif.mjs';
 
 export function json(response, status, value) {
   response.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
@@ -53,10 +54,61 @@ export async function createService({ directory, allowedOrigin }) {
       if (request.method === 'POST' && url.pathname === '/acquisitions') {
         const body = await requestBody(request);
         if (typeof body.entry !== 'string') throw Object.assign(new Error('missing_entry'), { status: 400 });
-        const result = await retrieve(body.entry, allowedOrigin);
-        const receipt = await archive.receive({ collectionId: body.collectionId, sourceKey: body.entry, revision: result.revision,
-          mediaType: result.mediaType, bytes: result.bytes, summary: summarize(result.bytes, result.mediaType) });
-        return json(response, 201, { collectionId: body.collectionId, receiptIds: [receipt.receiptId] });
+        const collectionId = body.collectionId;
+        const delivery = await retrieveDelivery(body.entry, allowedOrigin);
+        const receipts = [];
+
+        // 入口原文（交付索引或直接资料）先登记为真实收件。
+        const entryReceipt = await archive.receive({
+          collectionId, sourceKey: body.entry, revision: delivery.entry.revision,
+          mediaType: delivery.entry.mediaType, bytes: delivery.entry.bytes,
+          summary: summarize(delivery.entry.bytes, delivery.entry.mediaType)
+        });
+        receipts.push(entryReceipt);
+
+        const payloads = delivery.roots.length > 0
+          ? delivery.roots
+          : [delivery.entry];
+
+        for (const failure of delivery.failures) {
+          await archive.applyInterpretation(collectionId, {
+            records: [],
+            issues: [{
+              reason: failure.reason,
+              location: `delivery-root:${failure.href}`,
+              detail: '交付索引声明的入口未能领取，保留已领原文，不把缺件视为来源删除'
+            }]
+          });
+        }
+
+        for (const payload of payloads) {
+          const receipt = delivery.roots.length > 0
+            ? await archive.receive({
+              collectionId, sourceKey: payload.url, revision: payload.revision,
+              mediaType: payload.mediaType, bytes: payload.bytes,
+              summary: summarize(payload.bytes, payload.mediaType)
+            })
+            : entryReceipt;
+          if (!receipts.some(existing => existing.receiptId === receipt.receiptId)) receipts.push(receipt);
+
+          // 仅对 ABIF 原文做目录解释；非 ABIF 保持原始收件，不假装已解释。
+          if (payload.bytes.subarray(0, 4).toString('latin1') === 'ABIF') {
+            try {
+              const interpreted = interpretAbif(payload.bytes, { receiptId: receipt.receiptId });
+              await archive.applyInterpretation(collectionId, interpreted);
+            } catch (error) {
+              if (error.status !== 422) throw error;
+              await archive.applyInterpretation(collectionId, {
+                records: [],
+                issues: [{ reason: error.message, location: 'abif:header@0..33' }]
+              });
+            }
+          }
+        }
+        return json(response, 201, {
+          collectionId,
+          receiptIds: receipts.map(receipt => receipt.receiptId)
+        });
       }
       return json(response, 404, { error: 'not_found' });
     } catch (error) {
